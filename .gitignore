@@ -1,2 +1,5 @@
 test.py
 test.sh
+*.db
+config.py
+__pycache__
