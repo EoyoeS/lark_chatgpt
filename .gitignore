@@ -3,3 +3,4 @@ test.sh
 *.db
 config.py
 __pycache__
+*.log
