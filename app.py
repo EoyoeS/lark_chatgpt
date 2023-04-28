@@ -1,15 +1,18 @@
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pprint import pprint, pformat
 import sqlite3
-from itertools import chain, repeat
+from itertools import islice
 from threading import RLock
-from time import sleep
+from time import sleep, time
 from queue import Queue
+from traceback import format_exc
+from typing import Deque
+import os
 
 from flask import Flask, request, jsonify, abort
 import requests
-import openai
 
 from config import config
 
@@ -19,16 +22,22 @@ APP_SECRET = config['app_secret']
 VERIFICATION_TOKEN = config['verification_token']
 TOKEN_URL = 'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal'
 TENANT_ACCESS_TOKEN = ''
+CHAT_GPT_URL = 'https://api.openai.com/v1/chat/completions'
 REPLY_URL = 'https://open.feishu.cn/open-apis/im/v1/messages/{}/reply'
+
+# 表相关
 DB_PATH = 'example.db'  # 相对路径
+Q_INDEX = 0
+A_INDEX = 1
+TOKEN_INDEX = 2
+TOTAL_INDEX = 3
 
 api_keys = config['openai_api_keys']
-openai.proxy = '[::]:7890'
-pool = ThreadPoolExecutor()
+proxies = {'https': config['openai_proxy']}
+pool = ThreadPoolExecutor(3 * len(api_keys))
 app = Flask(__name__)
-db_lock = RLock()
-chatgpt_lock = [RLock() for _ in range(3)]
 message_queue = Queue()
+db_locks = {}
 
 
 def color(code: int):
@@ -44,30 +53,90 @@ yellow = color(33)
 blue = color(34)
 
 
-def chat_gpt(content: str, history: list, api_key: str) -> str:
-    # 调用 ChatGPT 接口
-    if history is not None:
-        questions = ({'role': 'user', 'content': conv[0]} for conv in history)
-        answers = ({'role': 'assistant', 'content': conv[1]} for conv in history)
-        messages = list(chain.from_iterable(zip(questions, answers)))
-    else:
-        messages = []
-    messages += [{'role': 'user', 'content': content}]
-    print(blue(messages))
-    try:
-        completion = openai.ChatCompletion.create(
-            api_key=api_key,
-            model="gpt-3.5-turbo",
-            messages=messages,
+# 从数据库中删除前n条历史记录
+def del_history(chat_id, num):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        f'delete from {chat_id} where rowid in (select rowid from {chat_id} limit ?)',
+        (num,),
+    )
+    con.commit()
+    con.close()
+
+
+# 从数据库中获取历史记录
+def get_history(chat_id):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(f'select * from {chat_id}')
+    history = cur.fetchall()
+    con.commit()
+    con.close()
+    return history
+
+
+# 删除数据库中的历史记录（表）
+def drop_history(chat_id):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(f'drop table if exists {chat_id}')
+    con.commit()
+    con.close()
+    db_locks.pop(chat_id, None)
+
+
+# 获取表锁
+def history_lock(chat_id):
+    if chat_id not in db_locks:
+        db_locks[chat_id] = RLock()
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute(
+            f'create table {chat_id} (question text, answer text, token_size integer, total_size integer)'
         )
-    except openai.error.RateLimitError:
-        return '手速太快了，休息一下吧'
-    except Exception as e:
-        with open('error.log', 'a') as f:
-            f.write(pformat(e))
-        return '出错了，我也不知道为什么'
-    print(green(pformat(completion)))
-    return completion.choices[0].message.content
+        con.commit()
+        con.close()
+    return db_locks[chat_id]
+
+
+# 将新的对话插入数据库
+def insert_history(chat_id, question, answer, token_size, total_size):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        f'insert into {chat_id} values (?, ?, ?, ?)',
+        (question, answer, token_size, total_size),
+    )
+    con.commit()
+    con.close()
+
+
+def chat_gpt(messages: list, api_key: str) -> tuple:
+    # 调用 ChatGPT 接口
+    print(blue(messages))
+    headers = {
+        'Authorization': 'Bearer ' + api_key,
+    }
+    j = {
+        "model": "gpt-3.5-turbo",
+        "messages": messages,
+    }
+
+    with requests.post(CHAT_GPT_URL, json=j, headers=headers, proxies=proxies) as r:
+        data = r.json()
+        reset_time = float(r.headers['x-ratelimit-reset-requests'][:-1])
+        status_code = r.status_code
+        pprint(r.status_code)
+    print(green(pformat(data)))
+    if status_code != 200:
+        return None, None, status_code, reset_time
+    return (
+        data['choices'][0]['message']['content'],
+        data['usage']['total_tokens'],
+        status_code,
+        reset_time,
+    )
 
 
 # 根据message_id，返回answer
@@ -85,7 +154,7 @@ def reply(message_id, answer):
     with requests.post(url, data, headers=headers) as r:
         if r.status_code == 200:
             return 200
-    # token失效或过期，重新获取
+    # TODO: token失效或过期（这里可以提前检测），重新获取
     print(yellow('token expired, renewing...'))
     with requests.post(
         TOKEN_URL, data={'app_id': APP_ID, 'app_secret': APP_SECRET}
@@ -101,6 +170,48 @@ def reply(message_id, answer):
             print(red('renew failed'))
 
 
+def answer_from_chatgpt(
+    question, chat_id, history: list, api_key: str, reset_times: Deque
+):
+    # 设历史记录中第num条到最后一条的token总数是小于等于4097的，求num的最小值
+    num = 0
+    pre_total_size = history[-1][TOTAL_INDEX] if history else 0
+    while pre_total_size > 4097:
+        pre_total_size -= history[num][TOKEN_INDEX]
+        num += 1
+    it = islice(history, num, None)
+    messages = sum(
+        (
+            [{'role': 'user', 'content': q}, {'role': 'assistant', 'content': a}]
+            for q, a, _, _ in it
+        ),
+        [],
+    )
+    messages += [{'role': 'user', 'content': question}]
+    while True:
+        sleep(max(reset_times.popleft() - time(), 0.0))
+        # 得到chatgpt的回复
+        answer, total_size, status_code, reset_time = tmp = chat_gpt(messages, api_key)
+        print(green(pformat(tmp)))
+        reset_times.append(time() + reset_time)
+        if status_code == 200:
+            break
+        # TODO: 受到taken限制，openai会返回发送的总token数，可以尝试从这方面修改
+        if status_code == 400:
+            if len(messages) == 1:
+                # 新消息太长了
+                return '输入太长了 (@_@;)'  # 新消息太长了要丢弃，不能影响历史记录
+            print(yellow('popping...'))
+            messages.pop(0)
+            messages.pop(0)
+            pre_total_size -= history[num][TOKEN_INDEX]
+            num += 1
+    token_size = total_size - pre_total_size
+    del_history(chat_id, num)  # 删除前num条历史记录
+    insert_history(chat_id, question, answer, token_size, total_size)
+    return answer
+
+
 # 替换掉@信息，保留用户的问题
 def get_qustion(message) -> str:
     question = json.loads(message['content'])['text']
@@ -110,68 +221,42 @@ def get_qustion(message) -> str:
     return question
 
 
-# 从数据库中获取历史记录
-def get_history(chat_id):
-    with db_lock:
-        con = sqlite3.connect(DB_PATH)
-        cur = con.cursor()
-        cur.execute(
-            f'create table if not exists {chat_id} (question text, answer text)'
-        )
-        cur.execute(f'select * from {chat_id}')
-        history = cur.fetchall()
-        con.commit()
-        con.close()
-    return history
-
-
-# 删除数据库中的历史记录（表）
-def delete_history(chat_id):
-    with db_lock:
-        con = sqlite3.connect(DB_PATH)
-        cur = con.cursor()
-        cur.execute(f'drop table if exists {chat_id}')
-        con.commit()
-        con.close()
-
-
-# 将新的对话插入数据库
-def insert_new_convestion(chat_id, question, answer):
-    with db_lock:
-        con = sqlite3.connect(DB_PATH)
-        cur = con.cursor()
-        cur.execute(f'insert into {chat_id} values (?, ?)', (question, answer))
-        con.commit()
-        con.close()
-
-
 # 处理消息
 def handle_message(message):
-    try:
-        chat_id, message_id = message['chat_id'], message['message_id']
+    chat_id, message_id = message['chat_id'], message['message_id']
+    with history_lock(chat_id):
         question = get_qustion(message)
-        if '/clear' in question:
-            delete_history(chat_id)
-            reply(message_id, '上下文已清除')
-        elif '@_all' not in question:
+        if '@_all' not in question:
             message_queue.put((question, message_id, chat_id))
             sleep(0.1)
             if not message_queue.empty():
-                reply(message_id, '正在思考中...')
-    except Exception as e:
-        with open('error.log', 'a') as f:
-            f.write(pformat(e))
-        print(red(e))
-        reply(message_id, '出错了，我也不知道为什么')
+                reply(message_id, '正在思考中，请等一下 ๑ᵒᯅᵒ๑')
 
 
-def reply_from_chatgpt(api_key: str):
+# 一个api key一个线程
+def chatgpt_doing(api_key: str):
+    reset_times = deque([0, 0, 0])
     while True:
         question, message_id, chat_id = message_queue.get()
-        answer = chat_gpt(question, get_history(chat_id), api_key)
-        insert_new_convestion(chat_id, question, answer)
+        if '/clear' in question:
+            drop_history(chat_id)
+            db_locks.pop(chat_id, None)
+            answer = '上下文已清除 ❛‿˂̵✧'
+        else:
+            try:
+                answer = answer_from_chatgpt(
+                    question,
+                    chat_id,
+                    get_history(chat_id),
+                    api_key,
+                    reset_times,
+                )
+            except Exception as e:
+                with open('error.log', 'a') as f:
+                    f.write(format_exc() + '\n')
+                print(red(format_exc()))
+                answer = '出错了，我也不知道为什么 ¯\_(ツ)_/¯'
         reply(message_id, answer)
-        sleep(60)
 
 
 @app.route('/api', methods=['POST'])
@@ -188,6 +273,11 @@ def api():
 
 
 if __name__ == '__main__':
-    for api_key in chain.from_iterable(repeat(api_key, 3) for api_key in api_keys):
-        pool.submit(reply_from_chatgpt, api_key)
-    app.run(host='0.0.0.0', port=8713, debug=True)
+    # 删库（跑路）
+    if os.path.isfile(DB_PATH):
+        os.remove(DB_PATH)
+        print(yellow('database dropped'))
+    # 一个api key有3个线程
+    for api_key in api_keys:
+        pool.submit(chatgpt_doing, api_key)
+    app.run(host='0.0.0.0', port=8713)

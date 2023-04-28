@@ -1,5 +1,4 @@
-test.py
-test.sh
+test.*
 *.db
 config.py
 __pycache__
