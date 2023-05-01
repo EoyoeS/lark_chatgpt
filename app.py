@@ -34,7 +34,8 @@ TOTAL_INDEX = 3
 
 api_keys = config['openai_api_keys']
 proxies = {'https': config['openai_proxy']}
-pool = ThreadPoolExecutor(3 * len(api_keys))
+handle_pool = ThreadPoolExecutor()
+chatgpt_pool = ThreadPoolExecutor(3 * len(api_keys))
 app = Flask(__name__)
 message_queue = Queue()
 db_locks = {}
@@ -122,21 +123,29 @@ def chat_gpt(messages: list, api_key: str) -> tuple:
         "model": "gpt-3.5-turbo",
         "messages": messages,
     }
-
-    with requests.post(CHAT_GPT_URL, json=j, headers=headers, proxies=proxies) as r:
-        data = r.json()
-        reset_time = float(r.headers['x-ratelimit-reset-requests'][:-1])
-        status_code = r.status_code
+    try:
+        with requests.post(CHAT_GPT_URL, json=j, headers=headers, proxies=proxies) as r:
+            data = r.json()
+            reset_time = float(r.headers['x-ratelimit-reset-requests'][:-1])
+            status_code = r.status_code
+            break_time = r.headers.get('x-ratelimit-reset-tokens', 0.0)
+        if break_time.endswith('ms'):
+            break_time = int(break_time[:-2]) / 1000
+        elif break_time.endswith('s'):
+            break_time = float(break_time[:-1])
+        else:
+            print(yellow('unknown break time'))
+            break_time = 20.0
+        print(green(pformat(data)))
+        if status_code != 200:
+            return None, 0, status_code, reset_time, break_time
+        answer = data['choices'][0]['message']['content']
+        total_size = data['usage']['total_tokens']
         pprint(r.status_code)
-    print(green(pformat(data)))
-    if status_code != 200:
-        return None, None, status_code, reset_time
-    return (
-        data['choices'][0]['message']['content'],
-        data['usage']['total_tokens'],
-        status_code,
-        reset_time,
-    )
+    except requests.exceptions.SSLError:
+        answer, total_size = '好困，睡着了 (⌯꒪꒫꒪)੭', 0
+        status_code, reset_time, break_time = 502, 0.0, 20.0
+    return answer, total_size, status_code, reset_time, break_time
 
 
 # 根据message_id，返回answer
@@ -171,7 +180,7 @@ def reply(message_id, answer):
 
 
 def answer_from_chatgpt(
-    question, chat_id, history: list, api_key: str, reset_times: Deque
+    question, chat_id, history: list, api_key: str, reset_times: list
 ):
     # 设历史记录中第num条到最后一条的token总数是小于等于4097的，求num的最小值
     num = 0
@@ -189,11 +198,15 @@ def answer_from_chatgpt(
     )
     messages += [{'role': 'user', 'content': question}]
     while True:
-        sleep(max(reset_times.popleft() - time(), 0.0))
+        t = max(max(reset_times[0].popleft(), reset_times[1]) - time(), 0.0)
+        print(yellow(f'waiting {t} seconds...'))
+        sleep(t)
         # 得到chatgpt的回复
-        answer, total_size, status_code, reset_time = tmp = chat_gpt(messages, api_key)
-        print(green(pformat(tmp)))
-        reset_times.append(time() + reset_time)
+        answer, total_size, status_code, reset_time, break_time = chat_gpt(
+            messages, api_key
+        )
+        reset_times[0].append(time() + reset_time)
+        reset_times[1] = time() + break_time
         if status_code == 200:
             break
         # TODO: 受到taken限制，openai会返回发送的总token数，可以尝试从这方面修改
@@ -206,6 +219,8 @@ def answer_from_chatgpt(
             messages.pop(0)
             pre_total_size -= history[num][TOKEN_INDEX]
             num += 1
+        if status_code == 502:
+            return answer
     token_size = total_size - pre_total_size
     del_history(chat_id, num)  # 删除前num条历史记录
     insert_history(chat_id, question, answer, token_size, total_size)
@@ -217,7 +232,7 @@ def get_qustion(message) -> str:
     question = json.loads(message['content'])['text']
     mentions = message.get('mentions', [])
     for mention in mentions:
-        question = question.replace(mention['key'], mention['name'])
+        question = question.replace(mention['key'], mention['name'], 1)
     return question
 
 
@@ -235,7 +250,7 @@ def handle_message(message):
 
 # 一个api key一个线程
 def chatgpt_doing(api_key: str):
-    reset_times = deque([0, 0, 0])
+    reset_times = [deque([0, 0, 0]), 0]
     while True:
         question, message_id, chat_id = message_queue.get()
         if '/clear' in question:
@@ -268,7 +283,7 @@ def api():
     if headers.get('token') != VERIFICATION_TOKEN or headers.get('app_id') != APP_ID:
         abort(403)
     message = request_data['event']['message']
-    handle_message(message)
+    handle_pool.submit(handle_message, message)
     return jsonify({'msg': 'ok'})
 
 
@@ -279,5 +294,5 @@ if __name__ == '__main__':
         print(yellow('database dropped'))
     # 一个api key有3个线程
     for api_key in api_keys:
-        pool.submit(chatgpt_doing, api_key)
+        chatgpt_pool.submit(chatgpt_doing, api_key)
     app.run(host='0.0.0.0', port=8713)
